@@ -250,9 +250,32 @@ def find_ffmpeg() -> Optional[str]:
     return None
 
 
+def sanitize(name: str) -> str:
+    return re.sub(r'[\\/*?:"<>|]', "_", str(name)).strip("_ ")
+
+
+def download_episode(host: str, username: str, password: str, series_name: str, season: str, ep: dict, ep_index: int, output_root: Path, fmt: Optional[str] = None):
+    ep_num = ep.get("episode_num") or (ep_index + 1)
+    title = ep.get("title", f"Episode {ep_num}")
+    stream_id = ep.get("id")
+    ext = ep.get("container_extension", "mp4")
+    url = f"{host}/series/{username}/{password}/{stream_id}.{ext}"
+    out_name = f"{series_name} S{int(season):02d}E{int(ep_num):02d} - {title}"
+
+    try:
+        season_num = int(season)
+        season_folder = f"Season {season_num:02d}"
+    except (ValueError, TypeError):
+        season_folder = f"Season {season}"
+
+    safe_show = sanitize(series_name)
+    season_dir = output_root / safe_show / season_folder
+    download_stream(url, out_name, season_dir, fmt)
+
+
 def download_stream(url: str, output_name: str, output_dir: Path, format_opts: Optional[str] = None):
     output_dir.mkdir(parents=True, exist_ok=True)
-    safe_name = re.sub(r'[\\/*?:"<>|]', "_", output_name).strip("_ ")
+    safe_name = sanitize(output_name)
     out_path = output_dir / f"{safe_name}.mp4"
 
     ffmpeg = find_ffmpeg()
@@ -337,8 +360,19 @@ def browse_series(entry: dict, output_dir: Path):
             print(f"  {i}. Season {s} ({count} episodes)")
         print(f" {'='*40}")
 
-        pick = input(" Season number (or [b]ack): ").strip().lower()
+        pick = input(" Season number (or [b]ack, or all): ").strip().lower()
         if pick == "b":
+            return
+
+        if pick == "all":
+            fmt = input(" Format override (leave blank for best): ").strip() or None
+            print(f"[*] Downloading ALL episodes for {entry['name']} sequentially (no async)...")
+            for season_key in seasons:
+                eps = episodes_by_season[season_key]
+                print(f"\n--- Season {season_key} ---")
+                for idx, ep in enumerate(eps):
+                    download_episode(host, username, password, entry["name"], season_key, ep, idx, output_dir, fmt)
+            print(f"\n[+] Entire series download complete: {entry['name']}")
             return
 
         if pick.isdigit():
@@ -360,22 +394,24 @@ def browse_episodes(series_name: str, season: str, episodes: list, host: str, us
             print(f"  {i}. Ep {ep_num}: {title}")
         print(f" {'='*40}")
 
-        pick = input(" Episode number to download (or [b]ack): ").strip().lower()
+        pick = input(" Episode number to download (or [b]ack, or all): ").strip().lower()
         if pick == "b":
+            return
+
+        if pick == "all":
+            fmt = input(" Format override (leave blank for best): ").strip() or None
+            print(f"[*] Downloading all {len(episodes)} episodes sequentially (no async)...")
+            for idx, ep in enumerate(episodes):
+                download_episode(host, username, password, series_name, season, ep, idx, output_dir, fmt)
+            print("[+] Season download complete.")
             return
 
         if pick.isdigit():
             idx = int(pick) - 1
             if 0 <= idx < len(episodes):
                 ep = episodes[idx]
-                ep_num = ep.get("episode_num", idx + 1)
-                title = ep.get("title", f"Episode {ep_num}")
-                stream_id = ep.get("id")
-                ext = ep.get("container_extension", "mp4")
-                url = f"{host}/series/{username}/{password}/{stream_id}.{ext}"
-                out_name = f"{series_name} S{int(season):02d}E{int(ep_num):02d} - {title}"
                 fmt = input(" Format override (leave blank for best): ").strip() or None
-                download_stream(url, out_name, output_dir, fmt)
+                download_episode(host, username, password, series_name, season, ep, idx, output_dir, fmt)
             else:
                 print(" [-] Invalid episode.")
 
@@ -560,7 +596,7 @@ def cmd_download(args):
     entries = parse_m3u(m3u)
     results = search_channels(entries, args.query, args.group)
 
-    if not delete_results:
+    if not results:
         print("[-] No matches found.")
         sys.exit(1)
 

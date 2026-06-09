@@ -2,7 +2,7 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║       ___                                                                    ║
-║     {~._.~}   KoalaIPTV v3.1 (PyInstaller Optimized)                         ║
+║     {~._.~}   KoalaIPTV v1.5 (PyInstaller onefile + icon)                    ║
 ║      ( Y )    Zero Bullshit. Just Streams.                                   ║
 ║     ()~*~()   Live • VOD • Series • yt-dlp Powered                           ║
 ║     (_)-(_)                                                                  ║
@@ -17,8 +17,12 @@ import subprocess
 import urllib.request
 import shutil
 import os
+import tempfile
+import zipfile
 from pathlib import Path
 from typing import Optional
+
+VERSION = "1.5"
 
 CONFIG_PATH = Path.home() / ".koala_iptv" / "config.json"
 M3U_CACHE_PATH = Path.home() / ".koala_iptv" / "playlist.m3u"
@@ -48,12 +52,16 @@ def get_executable_path() -> Path:
     return Path(__file__).resolve()
 
 
-def setup_system_path():
-    """Attempts to add the executable to the system PATH globally as 'koalaiptv'."""
+def setup_system_path(quiet: bool = False):
+    """Attempts to add the executable to the system PATH globally as 'koalaiptv'.
+    Called on every run (quietly) so that after updates or moving the portable folder,
+    the current location is always registered and 'koalaiptv' keeps working.
+    """
     exe_path = get_executable_path()
     exe_dir = exe_path.parent
     
-    print("[*] 🐨 Configuring system PATH settings...")
+    if not quiet:
+        print("[*] 🐨 Configuring system PATH settings...")
 
     # --- WINDOWS PATH CONFIGURATION ---
     if os.name == 'nt':
@@ -73,10 +81,11 @@ def setup_system_path():
                 ctypes.windll.user32.SendMessageW(0xFFFF, 0x001A, 0, "Environment")
                 print(f"[+] Added {exe_dir} to your Windows User PATH.")
                 print("[!] Note: You may need to restart your terminal window for 'koalaiptv' to activate.")
-            else:
+            elif not quiet:
                 print("[+] 'koalaiptv' directory is already in your Windows PATH.")
         except Exception as e:
-            print(f"[-] Could not automatically modify Windows Registry PATH: {e}")
+            if not quiet:
+                print(f"[-] Could not automatically modify Windows Registry PATH: {e}")
 
     # --- LINUX / MACOS PATH CONFIGURATION ---
     else:
@@ -89,15 +98,243 @@ def setup_system_path():
                 symlink_path.unlink()
             
             symlink_path.symlink_to(exe_path)
-            print(f"[+] Created system symlink at: {symlink_path}")
+            if not quiet:
+                print(f"[+] Created system symlink at: {symlink_path}")
             
             # Check if ~/.local/bin is in the active PATH shell environment
             if str(local_bin) not in os.environ.get("PATH", ""):
-                print(f"[!] Warning: {local_bin} is not in your system PATH variable.")
-                print("    To fix this, add this line to your ~/.bashrc or ~/.zshrc file:")
-                print(f'    export PATH="$HOME/.local/bin:$PATH"')
+                if not quiet:
+                    print(f"[!] Warning: {local_bin} is not in your system PATH variable.")
+                    print("    To fix this, add this line to your ~/.bashrc or ~/.zshrc file:")
+                    print(f'    export PATH="$HOME/.local/bin:$PATH"')
         except Exception as e:
-            print(f"[-] Could not automatically create system symlink: {e}")
+            if not quiet:
+                print(f"[-] Could not automatically create system symlink: {e}")
+
+
+def download_file(url: str, dest: Path, show_progress: bool = True) -> bool:
+    """Download a file with optional simple progress."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": f"KoalaIPTV-Updater/{VERSION}"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            total = int(resp.headers.get("Content-Length", 0))
+            downloaded = 0
+            block_size = 8192
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with open(dest, "wb") as f:
+                while True:
+                    chunk = resp.read(block_size)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if show_progress and total > 0:
+                        pct = int(downloaded * 100 / total)
+                        print(f"\r[*] Downloading update... {pct}% ({downloaded // 1024}KB)", end="", flush=True)
+            if show_progress:
+                print("\n[+] Download complete.")
+        return True
+    except Exception as e:
+        print(f"\n[-] Download failed: {e}")
+        return False
+
+
+def find_app_root(search_dir: Path) -> Path:
+    """Locate the folder inside an extracted archive that contains koalaiptv.exe."""
+    direct = search_dir / "koalaiptv.exe"
+    if direct.exists():
+        return search_dir
+    # Check immediate subdirs (common when zipping a versioned folder)
+    for child in search_dir.iterdir():
+        if child.is_dir():
+            if (child / "koalaiptv.exe").exists():
+                return child
+    # Deep search as last resort
+    for p in search_dir.rglob("koalaiptv.exe"):
+        return p.parent
+    raise FileNotFoundError("koalaiptv.exe not found inside the archive.")
+
+
+def spawn_windows_updater(target_dir: Path, source_dir: Path):
+    """Write and launch a detached batch that applies the update after current process exits."""
+    if os.name != "nt":
+        print("[-] Safe self-update currently supports Windows only.")
+        return False
+
+    bat_path = Path(tempfile.gettempdir()) / "koalaiptv-apply-update.bat"
+    new_exe = source_dir / "koalaiptv.exe"
+
+    # Build a robust updater batch. Uses robocopy for reliable folder sync.
+    # Simplified header to avoid mysterious ". was unexpected at this time." parser errors
+    # that can occur with chcp + EnableDelayedExpansion + UTF-8 .bat files on some setups.
+    bat = f'''@echo off
+setlocal
+
+set "TARGET={target_dir}"
+set "SOURCE={source_dir}"
+
+echo.
+echo [*] KoalaIPTV Self-Updater v{VERSION}
+echo     Preparing to apply update...
+echo     Current install: %TARGET%
+echo.
+
+echo     Waiting a moment for the running instance to release file locks...
+timeout /t 3 /nobreak >nul 2>&1
+
+echo     Syncing new files...
+robocopy "%SOURCE%" "%TARGET%" /E /PURGE /R:5 /W:2 /NFL /NDL /NJH /NJS /NC /NS
+if errorlevel 8 (
+  echo [-] Robocopy reported serious errors (code %errorlevel%).
+  echo     You may need to manually copy files from:
+  echo     %SOURCE%
+) else (
+  echo [+] Update files applied successfully.
+)
+
+echo     Removing temporary update files...
+rmdir /s /q "%SOURCE%" >nul 2>&1
+
+echo.
+echo [+] KoalaIPTV has been updated.
+echo     You can now run koalaiptv normally.
+echo.
+echo Press any key to close this window...
+pause >nul
+exit /b 0
+'''
+
+    try:
+        with open(bat_path, "w", encoding="utf-8") as f:
+            f.write(bat)
+        # Launch in a new visible window so user can see progress / errors.
+        # Using a new console makes it survive the parent exit cleanly.
+        subprocess.Popen(
+            f'cmd /c start "KoalaIPTV Updater" "{bat_path}"',
+            shell=True,
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        )
+        return True
+    except Exception as e:
+        print(f"[-] Failed to launch updater: {e}")
+        print(f"    Manual fallback: copy contents of {source_dir} over {target_dir}")
+        return False
+
+
+def cmd_update(args):
+    """Self-update the portable Windows build in-place without conflicts."""
+    exe_path = get_executable_path()
+    if not getattr(sys, "frozen", False):
+        print("[-] Update is only supported for the PyInstaller-built .exe distribution.")
+        print("    Run from the installed koalaiptv.exe (not from source .py).")
+        return
+
+    install_dir = exe_path.parent
+    print(f"[*] Current install dir: {install_dir}")
+    print(f"[*] Current version marker: {VERSION} (this binary)")
+
+    # Determine source URL
+    url = getattr(args, "url", None)
+    repo = getattr(args, "repo", None) or load_config().get("update_repo") or "JustMrKoala/koalaiptv"
+
+    if not url and repo:
+        print(f"[*] Checking GitHub for latest release in {repo} ...")
+        api = f"https://api.github.com/repos/{repo}/releases/latest"
+        try:
+            req = urllib.request.Request(api, headers={"User-Agent": f"KoalaIPTV-Updater/{VERSION}", "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                rel = json.loads(r.read().decode())
+            tag = rel.get("tag_name", "unknown")
+            print(f"[+] Latest release: {tag}")
+            assets = rel.get("assets", [])
+            # Prefer assets that look like our portable win build (e.g. koalaiptv1.4win.zip)
+            candidates = [a for a in assets if a.get("name", "").lower().endswith(".zip")]
+            win_asset = None
+            def _score(n: str) -> int:
+                n = n.lower()
+                s = 0
+                if "koalaiptv" in n: s += 10
+                if "win" in n or "windows" in n: s += 5
+                if "portable" in n: s += 3
+                if any(x in n for x in ("src", "source", "linux", "mac", "darwin", "code")): s -= 20
+                return s
+            if candidates:
+                scored = sorted(candidates, key=lambda a: _score(a.get("name", "")), reverse=True)
+                win_asset = scored[0]
+            if win_asset:
+                url = win_asset.get("browser_download_url")
+                print(f"[*] Selected asset: {win_asset.get('name')}")
+            else:
+                print("[-] No suitable .zip asset found in the latest release.")
+        except Exception as e:
+            print(f"[-] GitHub check failed: {e}")
+
+    if not url:
+        print("\n[!] No update URL available.")
+        print("    Provide one explicitly:")
+        print(f"      koalaiptv update --url https://github.com/JustMrKoala/koalaiptv/releases/download/{VERSION}/koalaiptv{VERSION}win.zip")
+        print("    Or it will auto-use the default repo (JustMrKoala/koalaiptv) when you run:")
+        print("      koalaiptv update")
+        print("    (Or set a different one with: koalaiptv configure --update-repo owner/repo )")
+        return
+
+    print(f"[*] Update package: {url}")
+
+    if not getattr(args, "yes", False):
+        confirm = input("Download and apply this update now? [y/N]: ").strip().lower()
+        if confirm not in ("y", "yes"):
+            print("[-] Update cancelled.")
+            return
+
+    tmp_zip = Path(tempfile.gettempdir()) / f"koalaiptv_update_{os.getpid()}.zip"
+    tmp_extract = Path(tempfile.mkdtemp(prefix="koalaiptv_new_"))
+
+    print("[*] Downloading...")
+    if not download_file(url, tmp_zip):
+        shutil.rmtree(tmp_extract, ignore_errors=True)
+        return
+
+    print("[*] Extracting archive...")
+    try:
+        with zipfile.ZipFile(tmp_zip) as z:
+            z.extractall(tmp_extract)
+    except Exception as e:
+        print(f"[-] Extract failed: {e}")
+        shutil.rmtree(tmp_extract, ignore_errors=True)
+        tmp_zip.unlink(missing_ok=True)
+        return
+
+    try:
+        source_dir = find_app_root(tmp_extract)
+        print(f"[*] Update content found at: {source_dir}")
+    except Exception as e:
+        print(f"[-] {e}")
+        shutil.rmtree(tmp_extract, ignore_errors=True)
+        tmp_zip.unlink(missing_ok=True)
+        return
+
+    # Verify it looks valid
+    if not (source_dir / "koalaiptv.exe").exists():
+        print("[-] Archive did not contain a valid koalaiptv.exe. Aborting.")
+        shutil.rmtree(tmp_extract, ignore_errors=True)
+        tmp_zip.unlink(missing_ok=True)
+        return
+
+    print("[*] Preparing safe in-place update (will not conflict with running copy)...")
+    ok = spawn_windows_updater(install_dir, source_dir)
+    if ok:
+        print("\n[+] Updater launched in a new window. This process will now exit so files can be replaced.")
+        print("    A separate console window is applying the update (wait + robocopy).")
+        print("    Watch the new window for progress. It will pause at the end so you can read any messages.")
+        print("    After it finishes, run 'koalaiptv' again to use the new version.")
+        # Give the Popen a moment, then exit hard so locks are released ASAP
+        import time
+        time.sleep(0.4)
+        os._exit(0)
+    else:
+        print("[-] Could not start automatic updater.")
+        print(f"    New files are here: {source_dir}")
+        print(f"    Please close KoalaIPTV completely and copy them manually over {install_dir}")
 
 
 def fetch_url(url: str) -> dict | list:
@@ -548,7 +785,7 @@ def run_wizard(cfg: dict, fresh: bool = False) -> dict:
 
 def cmd_configure(args):
     cfg = load_config()
-    flags = [args.host, args.username, args.password, getattr(args, "output_dir", None)]
+    flags = [args.host, args.username, args.password, getattr(args, "output_dir", None), getattr(args, "update_repo", None)]
     if any(flags):
         if args.host:
             cfg["host"] = args.host
@@ -558,6 +795,8 @@ def cmd_configure(args):
             cfg["password"] = args.password
         if getattr(args, "output_dir", None):
             cfg["output_dir"] = args.output_dir
+        if getattr(args, "update_repo", None):
+            cfg["update_repo"] = args.update_repo
         save_config(cfg)
         print("[+] Configuration saved.")
     else:
@@ -622,13 +861,47 @@ def cmd_download(args):
         download_stream(chosen["url"], chosen["name"], out_dir, args.format)
 
 
-def main():
-    if not check_yt_dlp():
-        print("[-] yt-dlp is not installed or not in PATH. Install it with: pip install yt-dlp")
-        sys.exit(1)
+def get_latest_version(repo: str = "JustMrKoala/koalaiptv") -> Optional[str]:
+    """Quick non-fatal check for the latest release tag on GitHub."""
+    try:
+        api = f"https://api.github.com/repos/{repo}/releases/latest"
+        req = urllib.request.Request(
+            api,
+            headers={"User-Agent": f"KoalaIPTV/{VERSION}", "Accept": "application/vnd.github+json"}
+        )
+        with urllib.request.urlopen(req, timeout=6) as r:
+            data = json.loads(r.read().decode())
+            tag = (data.get("tag_name") or "").lstrip("vV")
+            return tag or None
+    except Exception:
+        return None
 
+
+def _is_newer_version(latest: str, current: str) -> bool:
+    """True only if latest from server is strictly greater than our VERSION."""
+    def _t(s: str):
+        try:
+            return tuple(int(x) for x in s.split(".") if x.strip().isdigit())
+        except Exception:
+            return (0,)
+    try:
+        return _t(latest) > _t(current)
+    except Exception:
+        return False  # never auto-claim "newer" on parse problems
+
+
+def main():
     first_run = not CONFIG_PATH.exists()
     no_args = len(sys.argv) == 1
+
+    # Ensure the directory of this executable/script is on the user's PATH on every launch.
+    # This makes updates (and extracting a new build to a different folder) "just work"
+    # without the user having to re-run configure or manually fix PATH.
+    # Works for both the PyInstaller .exe and when executing the .py directly.
+    try:
+        setup_system_path(quiet=True)
+    except Exception:
+        pass  # never let PATH setup block or crash startup
 
     # Intercept the very first run without flags
     if first_run and no_args:
@@ -641,6 +914,7 @@ def main():
         prog="koalaiptv",
         description="KoalaIPTV: CLI client with Xtream-to-M3U conversion and yt-dlp downloading.",
     )
+    parser.add_argument("--version", action="version", version=f"KoalaIPTV {VERSION}")
     
     # Notice: Removed 'required=True' so we can handle empty commands gracefully
     sub = parser.add_subparsers(dest="command")
@@ -650,6 +924,7 @@ def main():
     p_cfg.add_argument("--username")
     p_cfg.add_argument("--password")
     p_cfg.add_argument("--output-dir")
+    p_cfg.add_argument("--update-repo", help="GitHub owner/repo for automatic update checks (e.g. yourname/iptvcli)")
     p_cfg.set_defaults(func=cmd_configure)
 
     p_conv = sub.add_parser("convert", help="Convert Xtream credentials to M3U playlist")
@@ -673,13 +948,49 @@ def main():
     p_dl.add_argument("--first", action="store_true", help="Auto-select first result without prompting")
     p_dl.set_defaults(func=cmd_download)
 
+    p_up = sub.add_parser("update", help="Self-update this portable build (auto-updater, runs from inside koalaiptv)")
+    p_up.add_argument("--url", help="Direct download URL to a new portable .zip (recommended for control)")
+    p_up.add_argument("--repo", help="GitHub repo (owner/repo) to fetch latest release asset from automatically")
+    p_up.add_argument("--yes", "-y", action="store_true", help="Apply without interactive confirmation")
+    p_up.set_defaults(func=cmd_update)
+
     # If they run it without flags AFTER the first time, show the help menu
+    # Also opportunistically check for updates so that simply running "koalaiptv"
+    # acts as a lightweight auto-updater notifier (no network hit on subcommands).
     if no_args:
+        repo = load_config().get("update_repo") or "JustMrKoala/koalaiptv"
+        latest = get_latest_version(repo)
+        if latest and _is_newer_version(latest, VERSION):
+            print(f"\n[!] New version available: {latest}  (you are on {VERSION})")
+            print("    Run:  koalaiptv update")
+            print("    (or let the built-in updater download + apply the portable build)\n")
+            # Offer a seamless auto-update experience when user just double-clicks / runs the exe
+            try:
+                ans = input("Update to the latest version now? [Y/n]: ").strip().lower()
+            except EOFError:
+                ans = ""
+            if ans in ("", "y", "yes"):
+                class _UpdArgs:
+                    url = None
+                    repo = None
+                    yes = True
+                try:
+                    cmd_update(_UpdArgs())
+                    # cmd_update may _exit on success path
+                    return
+                except SystemExit:
+                    return
         parser.print_help()
         sys.exit(0)
 
     args = parser.parse_args()
-    
+
+    # yt-dlp is only required for commands that actually download streams
+    needs_yt = getattr(args, "command", None) in ("search", "download")
+    if needs_yt and not check_yt_dlp():
+        print("[-] yt-dlp is not installed or not in PATH. Install it with: pip install yt-dlp")
+        sys.exit(1)
+
     # Execute the selected subcommand
     if hasattr(args, 'func'):
         args.func(args)

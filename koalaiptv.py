@@ -2,7 +2,7 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║       ___                                                                    ║
-║     {~._.~}   KoalaIPTV v1.5 (PyInstaller onefile + icon)                    ║
+║     {~._.~}   KoalaIPTV v1.6 (PyInstaller onefile + icon)                    ║
 ║      ( Y )    Zero Bullshit. Just Streams.                                   ║
 ║     ()~*~()   Live • VOD • Series • yt-dlp Powered                           ║
 ║     (_)-(_)                                                                  ║
@@ -22,7 +22,43 @@ import zipfile
 from pathlib import Path
 from typing import Optional
 
-VERSION = "1.5"
+VERSION = "1.6"
+
+HELP_BANNER = f"""
+       ___
+     {{~._.~}}   KoalaIPTV v{VERSION}
+      ( Y )    Zero Bullshit. Just Streams.
+     ()~*~()   Live  |  VOD  |  Series  |  yt-dlp Powered
+     (_)-(_)
+"""
+
+class KoalaHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    def format_help(self):
+        return HELP_BANNER + "\n" + super().format_help()
+
+
+HELP_EPILOG = """
+commands:
+  configure   Save Xtream provider credentials and download folder
+  convert     Build an M3U playlist from your provider
+  search      Interactive search and download
+  download    Search by name and download (scriptable)
+  update      Self-update this portable Windows build
+
+download location (search / download):
+  (default)   Uses the folder from configure (or ./koala_downloads)
+  -c          Save to the current directory you run the command from
+  --output-dir <path>   Override with a specific folder
+
+examples:
+  koalaiptv search
+  koalaiptv -c search
+  koalaiptv download "Breaking Bad" --first
+  koalaiptv -c download "CNN" --first
+  koalaiptv convert
+  koalaiptv configure
+  koalaiptv update
+""".strip()
 
 CONFIG_PATH = Path.home() / ".koala_iptv" / "config.json"
 M3U_CACHE_PATH = Path.home() / ".koala_iptv" / "playlist.m3u"
@@ -815,13 +851,23 @@ def cmd_convert(args):
     xtream_to_m3u(host, username, password, out)
 
 
+def resolve_output_dir(args, cfg: dict) -> Path:
+    if getattr(args, "current", False):
+        return Path.cwd().resolve()
+    if getattr(args, "output_dir", None):
+        return Path(args.output_dir).resolve()
+    return Path(cfg.get("output_dir", "./koala_downloads")).resolve()
+
+
 def cmd_search(args):
     cfg = load_config()
     m3u = Path(args.m3u) if args.m3u else M3U_CACHE_PATH
     if not m3u.exists():
         print(f"[-] M3U not found at {m3u}. Run 'convert' first or pass --m3u.")
         sys.exit(1)
-    out_dir = Path(args.output_dir) if args.output_dir else Path(cfg.get("output_dir", "./koala_downloads"))
+    out_dir = resolve_output_dir(args, cfg)
+    if getattr(args, "current", False):
+        print(f"[*] Download folder: current directory ({out_dir})")
     interactive_search(m3u, out_dir)
 
 
@@ -853,7 +899,9 @@ def cmd_download(args):
             sys.exit(1)
         chosen = results[idx]
 
-    out_dir = Path(args.output_dir) if args.output_dir else Path(cfg.get("output_dir", "./koala_downloads"))
+    out_dir = resolve_output_dir(args, cfg)
+    if getattr(args, "current", False):
+        print(f"[*] Download folder: current directory ({out_dir})")
 
     if chosen.get("series_id"):
         browse_series(chosen, out_dir)
@@ -912,12 +960,18 @@ def main():
 
     parser = argparse.ArgumentParser(
         prog="koalaiptv",
-        description="KoalaIPTV: CLI client with Xtream-to-M3U conversion and yt-dlp downloading.",
+        description="Xtream-to-M3U conversion and yt-dlp powered downloading.",
+        epilog=HELP_EPILOG,
+        formatter_class=KoalaHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"KoalaIPTV {VERSION}")
-    
-    # Notice: Removed 'required=True' so we can handle empty commands gracefully
-    sub = parser.add_subparsers(dest="command")
+    parser.add_argument(
+        "-c", "--current",
+        action="store_true",
+        help="download to the current working directory (search / download)",
+    )
+
+    sub = parser.add_subparsers(dest="command", metavar="<command>")
 
     p_cfg = sub.add_parser("configure", help="Save connection settings")
     p_cfg.add_argument("--host")
@@ -937,6 +991,7 @@ def main():
     p_search = sub.add_parser("search", help="Interactive search and download from M3U")
     p_search.add_argument("--m3u", help="Path to .m3u file")
     p_search.add_argument("--output-dir", help="Where to save downloaded files")
+    p_search.add_argument("-c", "--current", action="store_true", help="Save to current working directory")
     p_search.set_defaults(func=cmd_search)
 
     p_dl = sub.add_parser("download", help="Non-interactive: search and download by query")
@@ -944,6 +999,7 @@ def main():
     p_dl.add_argument("--m3u", help="Path to .m3u file")
     p_dl.add_argument("--group", help="Filter by group name")
     p_dl.add_argument("--output-dir", help="Where to save downloaded files")
+    p_dl.add_argument("-c", "--current", action="store_true", help="Save to current working directory")
     p_dl.add_argument("--format", help="yt-dlp format string (default: bestvideo+bestaudio/best)")
     p_dl.add_argument("--first", action="store_true", help="Auto-select first result without prompting")
     p_dl.set_defaults(func=cmd_download)
@@ -984,6 +1040,9 @@ def main():
         sys.exit(0)
 
     args = parser.parse_args()
+    if getattr(args, "current", False) and getattr(args, "command", None) not in ("search", "download"):
+        print("[-] -c / --current only applies to search and download commands.")
+        sys.exit(2)
 
     # yt-dlp is only required for commands that actually download streams
     needs_yt = getattr(args, "command", None) in ("search", "download")
